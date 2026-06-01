@@ -22,15 +22,14 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot          = commands.Bot(command_prefix="!", intents=intents)
-groq_client  = Groq(api_key=GROQ_API_KEY)
-tavily       = TavilyClient(api_key=TAVILY_API_KEY)
+bot         = commands.Bot(command_prefix="!", intents=intents)
+groq_client = Groq(api_key=GROQ_API_KEY)
+tavily      = TavilyClient(api_key=TAVILY_API_KEY)
 
 # ─── ESTADO ───────────────────────────────────────────────────────────────────
 conversation_history = {}
 MAX_HISTORY = 20
-
-DATA_FILE = "data.json"
+DATA_FILE   = "data.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -51,64 +50,57 @@ def get_server_data(guild_id):
     return server_data[gid]
 
 # ─── PESQUISA WEB ─────────────────────────────────────────────────────────────
-def needs_search(message: str) -> bool:
-    """Decide se a mensagem precisa de pesquisa web."""
-    keywords = [
-        "tempo", "clima", "previsão", "temperatura",
-        "notícias", "noticia", "hoje", "agora", "atual", "atualmente",
-        "último", "ultima", "recente", "novidade",
-        "preço", "valor", "cotação", "euro", "dólar",
-        "jogo", "resultado", "placard", "marcador",
-        "quem é", "quem foi", "o que é", "quando foi",
-        "search", "pesquisa", "procura", "encontra",
-        "2024", "2025", "2026",
-    ]
-    msg_lower = message.lower()
-    return any(k in msg_lower for k in keywords)
-
 def web_search(query: str) -> str:
-    """Faz pesquisa web via Tavily e devolve resultados formatados."""
     try:
-        results = tavily.search(query=query, max_results=4, search_depth="basic")
+        results = tavily.search(query=query, max_results=5, search_depth="basic")
         output = []
         for r in results.get("results", []):
             title   = r.get("title", "")
-            content = r.get("content", "")[:400]
+            content = r.get("content", "")[:500]
             url     = r.get("url", "")
-            output.append(f"**{title}**\n{content}\nFonte: {url}")
-        return "\n\n".join(output) if output else "Sem resultados encontrados."
+            output.append(f"- {title}: {content} (fonte: {url})")
+        return "\n".join(output) if output else ""
     except Exception as e:
-        return f"Erro na pesquisa: {e}"
+        print(f"Tavily error: {e}")
+        return ""
 
 # ─── GROQ CHAT ────────────────────────────────────────────────────────────────
-def ask_groq(user_id, user_message, system_prompt=None, search_context=None):
+def ask_groq(user_id, user_message, search_context=None, system_override=None):
     uid = str(user_id)
     if uid not in conversation_history:
         conversation_history[uid] = []
 
-    # Adiciona contexto de pesquisa à mensagem se existir
-    full_message = user_message
-    if search_context:
-        full_message = (
-            f"Pergunta do utilizador: {user_message}\n\n"
-            f"Resultados de pesquisa web atual:\n{search_context}\n\n"
-            f"Com base nestes resultados, responde à pergunta de forma clara e concisa em português europeu."
-        )
+    hoje = datetime.now().strftime("%d/%m/%Y")
 
-    conversation_history[uid].append({"role": "user", "content": full_message})
+    if system_override:
+        system = system_override
+    elif search_context:
+        system = f"""És um assistente AI no Discord. Hoje é {hoje}.
+Respondes SEMPRE em português europeu, de forma direta e útil.
+Usa formatação Discord: **negrito**, `código`, etc.
 
+TENS ACESSO À INTERNET. Os seguintes resultados foram obtidos agora mesmo da web para responder à pergunta do utilizador:
+
+=== RESULTADOS WEB ATUAIS ===
+{search_context}
+=== FIM DOS RESULTADOS ===
+
+INSTRUÇÕES OBRIGATÓRIAS:
+1. USA os resultados acima para responder — são informação real e atual
+2. NUNCA digas que não tens acesso à internet — TENS, os resultados provam isso
+3. NUNCA digas que o teu conhecimento tem uma data limite — tens dados de hoje
+4. Responde com base nos resultados fornecidos, citando fontes quando útil
+5. Se os resultados não tiverem info suficiente, diz o que encontraste"""
+    else:
+        system = f"""És um assistente AI no Discord. Hoje é {hoje}.
+Respondes SEMPRE em português europeu, de forma direta e útil.
+Usa formatação Discord: **negrito**, `código`, etc."""
+
+    conversation_history[uid].append({"role": "user", "content": user_message})
     if len(conversation_history[uid]) > MAX_HISTORY:
         conversation_history[uid] = conversation_history[uid][-MAX_HISTORY:]
 
-    sys_prompt = system_prompt or (
-        "És um assistente inteligente integrado no Discord. "
-        "Respondes sempre em português europeu de forma clara e direta. "
-        "Quando tens resultados de pesquisa web, usa-os para dar informação atual e precisa. "
-        "Usa formatação Discord: **bold**, `código`, etc. "
-        "Sê conciso mas completo."
-    )
-
-    messages = [{"role": "system", "content": sys_prompt}] + conversation_history[uid]
+    messages = [{"role": "system", "content": system}] + conversation_history[uid]
 
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
@@ -118,18 +110,12 @@ def ask_groq(user_id, user_message, system_prompt=None, search_context=None):
     )
 
     reply = response.choices[0].message.content
-    # Guarda no histórico a mensagem original (sem o contexto de pesquisa)
-    conversation_history[uid][-1] = {"role": "user", "content": user_message}
     conversation_history[uid].append({"role": "assistant", "content": reply})
     return reply
 
 # ─── RESPOSTA PRINCIPAL ───────────────────────────────────────────────────────
-async def process_message(message_or_interaction, content, user_id, reply_func):
-    search_context = None
-
-    if needs_search(content):
-        search_context = web_search(content)
-
+async def respond(content: str, user_id: int, reply_func):
+    search_context = web_search(content)
     reply = ask_groq(user_id, content, search_context=search_context)
 
     if len(reply) <= 1900:
@@ -149,9 +135,9 @@ async def on_ready():
     ))
     try:
         synced = await bot.tree.sync()
-        print(f"✅ {len(synced)} comandos slash sincronizados")
+        print(f"✅ {len(synced)} comandos sincronizados")
     except Exception as e:
-        print(f"❌ Erro ao sincronizar: {e}")
+        print(f"❌ Erro sync: {e}")
 
 @bot.event
 async def on_message(message):
@@ -184,7 +170,7 @@ async def on_message(message):
 
         async with message.channel.typing():
             try:
-                await process_message(message, content, message.author.id, message.reply)
+                await respond(content, message.author.id, message.reply)
             except Exception as e:
                 await message.reply(f"❌ Erro: `{e}`")
 
@@ -193,25 +179,22 @@ async def handle_checklist_message(message):
     guild_id = message.guild.id
     data = get_server_data(guild_id)
 
-    prompt = f"""
-O utilizador disse: "{message.content}"
-A checklist atual é: {json.dumps(data['checklist'], ensure_ascii=False)}
+    prompt = f"""Utilizador disse: "{message.content}"
+Checklist atual: {json.dumps(data['checklist'], ensure_ascii=False)}
 
-Responde APENAS com JSON válido:
-- Adicionar: {{"action": "add", "item": "nome"}}
-- Marcar feito: {{"action": "check", "item": "nome"}}
-- Desmarcar: {{"action": "uncheck", "item": "nome"}}
-- Remover: {{"action": "remove", "item": "nome"}}
-- Ver lista: {{"action": "show"}}
-- Limpar feitos: {{"action": "clear_done"}}
-- Outro: {{"action": "unknown"}}
-"""
+Responde APENAS com JSON, sem mais texto:
+{{"action": "add"|"check"|"uncheck"|"remove"|"show"|"clear_done"|"unknown", "item": "nome se aplicável"}}"""
+
     try:
         raw = ask_groq(message.author.id + 99999, prompt,
-                       system_prompt="Respondes APENAS com JSON válido, sem texto extra.")
+                       system_override="Respondes APENAS com JSON válido numa única linha, sem texto extra, sem markdown.")
         raw = re.sub(r"```json|```", "", raw).strip()
-        result = json.loads(raw)
-        action = result.get("action")
+        # pegar só o primeiro JSON da resposta
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        result    = json.loads(raw)
+        action    = result.get("action")
         item_name = result.get("item", "").strip()
 
         if action == "add":
@@ -230,7 +213,7 @@ Responde APENAS com JSON válido:
                 await message.add_reaction("✅")
                 await show_checklist(message, data)
             else:
-                await message.reply(f"❓ Não encontrei '{item_name}' na checklist.")
+                await message.reply(f"❓ Não encontrei '{item_name}'.")
         elif action == "uncheck":
             for item in data["checklist"]:
                 if item_name.lower() in item["text"].lower():
@@ -252,11 +235,11 @@ Responde APENAS com JSON válido:
         else:
             await message.reply("❓ Tenta: *'adiciona X'*, *'marca X como feito'*, *'mostra a lista'*")
     except Exception as e:
-        await message.reply(f"❌ Erro: `{e}`")
+        await message.reply(f"❌ Erro checklist: `{e}`")
 
 async def show_checklist(message, data):
     if not data["checklist"]:
-        await message.channel.send("📋 A checklist está vazia.")
+        await message.channel.send("📋 Checklist vazia.")
         return
     lines = ["**📋 Checklist:**"]
     for item in data["checklist"]:
@@ -270,31 +253,27 @@ async def handle_task_message(message):
     guild_id = message.guild.id
     data = get_server_data(guild_id)
 
-    prompt = f"""
-O utilizador disse: "{message.content}"
-Tarefas atuais: {json.dumps(data['tasks'], ensure_ascii=False)}
+    prompt = f"""Utilizador disse: "{message.content}"
+Tarefas: {json.dumps(data['tasks'], ensure_ascii=False)}
 
-Responde APENAS com JSON:
-- Adicionar: {{"action": "add", "title": "título", "desc": "descrição opcional"}}
-- Concluir: {{"action": "done", "title": "título"}}
-- Remover: {{"action": "remove", "title": "título"}}
-- Listar: {{"action": "show"}}
-- Outro: {{"action": "unknown"}}
-"""
+Responde APENAS com JSON numa única linha:
+{{"action": "add"|"done"|"remove"|"show"|"unknown", "title": "título", "desc": "opcional"}}"""
+
     try:
         raw = ask_groq(message.author.id + 88888, prompt,
-                       system_prompt="Respondes APENAS com JSON válido, sem texto extra.")
+                       system_override="Respondes APENAS com JSON válido numa única linha, sem texto extra, sem markdown.")
         raw = re.sub(r"```json|```", "", raw).strip()
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
         result = json.loads(raw)
         action = result.get("action")
         title  = result.get("title", "").strip()
         desc   = result.get("desc", "")
 
         if action == "add":
-            data["tasks"].append({
-                "title": title, "desc": desc, "done": False,
-                "created": datetime.now().strftime("%d/%m/%Y %H:%M")
-            })
+            data["tasks"].append({"title": title, "desc": desc, "done": False,
+                                  "created": datetime.now().strftime("%d/%m/%Y %H:%M")})
             save_data(server_data)
             await message.add_reaction("📝")
             await show_tasks(message, data)
@@ -313,9 +292,9 @@ Responde APENAS com JSON:
         elif action == "show":
             await show_tasks(message, data)
         else:
-            await message.reply("❓ Tenta: *'adiciona tarefa X'*, *'marca X como feita'*, *'mostra tarefas'*")
+            await message.reply("❓ Tenta: *'adiciona tarefa X'*, *'marca X como feita'*")
     except Exception as e:
-        await message.reply(f"❌ Erro: `{e}`")
+        await message.reply(f"❌ Erro tarefas: `{e}`")
 
 async def show_tasks(message, data):
     if not data["tasks"]:
@@ -340,42 +319,31 @@ async def show_tasks(message, data):
 async def slash_ask(interaction: discord.Interaction, pergunta: str):
     await interaction.response.defer()
     try:
-        search_context = web_search(pergunta) if needs_search(pergunta) else None
+        search_context = web_search(pergunta)
         reply = ask_groq(interaction.user.id, pergunta, search_context=search_context)
-        await interaction.followup.send(f"**Tu:** {pergunta}\n\n**Assistente:** {reply}")
+        await interaction.followup.send(f"**Tu:** {pergunta}\n\n{reply}")
     except Exception as e:
         await interaction.followup.send(f"❌ Erro: `{e}`")
 
-@bot.tree.command(name="pesquisar", description="Pesquisa algo na web agora mesmo")
-@app_commands.describe(query="O que queres pesquisar")
-async def slash_search(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    try:
-        results = web_search(query)
-        reply = ask_groq(interaction.user.id, query, search_context=results)
-        await interaction.followup.send(f"🔍 **Pesquisa:** {query}\n\n{reply}")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erro: `{e}`")
-
-@bot.tree.command(name="limpar_historico", description="Apaga o histórico da tua conversa")
+@bot.tree.command(name="limpar_historico", description="Apaga o histórico da conversa")
 async def slash_clear(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     if uid in conversation_history:
         conversation_history[uid] = []
     await interaction.response.send_message("🗑️ Histórico apagado!", ephemeral=True)
 
-@bot.tree.command(name="checklist", description="Mostra a checklist atual")
+@bot.tree.command(name="checklist", description="Mostra a checklist")
 async def slash_checklist(interaction: discord.Interaction):
     data = get_server_data(interaction.guild_id)
     if not data["checklist"]:
-        await interaction.response.send_message("📋 A checklist está vazia.", ephemeral=True)
+        await interaction.response.send_message("📋 Checklist vazia.", ephemeral=True)
         return
     lines = ["**📋 Checklist:**"]
     for item in data["checklist"]:
         lines.append(f"{'✅' if item['done'] else '⬜'} {item['text']}")
     await interaction.response.send_message("\n".join(lines))
 
-@bot.tree.command(name="tarefas", description="Mostra as tarefas atuais")
+@bot.tree.command(name="tarefas", description="Mostra as tarefas")
 async def slash_tasks(interaction: discord.Interaction):
     await interaction.response.defer()
     data = get_server_data(interaction.guild_id)
@@ -395,34 +363,23 @@ async def slash_tasks(interaction: discord.Interaction):
             lines.append(f"✅ ~~{t['title']}~~")
     await interaction.followup.send("\n".join(lines))
 
-@bot.tree.command(name="ajuda", description="Mostra como usar o bot")
+@bot.tree.command(name="ajuda", description="Como usar o bot")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="🤖 Assistente AI — Ajuda", color=0x5865F2)
     embed.add_field(name="💬 Chat", value=(
         "• Menciona-me: `@Bot pergunta`\n"
         "• Em DM: escreve diretamente\n"
-        "• Canais com 'bot' ou 'ia' no nome: escreve livremente\n"
-        "• `/perguntar` — comando slash\n"
-        "• `/pesquisar` — pesquisa web forçada"
+        "• Canais com 'bot' ou 'ia' no nome: escreve livremente"
     ), inline=False)
-    embed.add_field(name="🔍 Pesquisa Web", value=(
-        "O bot pesquisa automaticamente quando precisas de info atual:\n"
-        "tempo, notícias, preços, resultados, etc."
-    ), inline=False)
+    embed.add_field(name="🔍 Pesquisa Web", value="Pesquiso sempre na web antes de responder!", inline=False)
     embed.add_field(name="✅ Checklist (#checklist)", value=(
-        "• *'adiciona comprar leite'*\n"
-        "• *'marca comprar leite como feito'*\n"
-        "• *'mostra a lista'* / *'limpa os feitos'*"
+        "• *'adiciona X'* • *'marca X como feito'*\n• *'mostra a lista'* • *'limpa os feitos'*"
     ), inline=False)
     embed.add_field(name="📝 Tarefas (#tarefas)", value=(
-        "• *'adiciona tarefa reunião amanhã'*\n"
-        "• *'marca reunião como feita'*\n"
-        "• *'mostra as tarefas'*"
+        "• *'adiciona tarefa X'* • *'marca X como feita'*\n• *'mostra as tarefas'*"
     ), inline=False)
-    embed.add_field(name="⚙️ Comandos", value=(
-        "`/perguntar` `/pesquisar` `/checklist` `/tarefas` `/limpar_historico`"
-    ), inline=False)
-    embed.set_footer(text="Powered by Groq (LLaMA 3.3) + Tavily Search")
+    embed.add_field(name="⚙️ Comandos", value="`/perguntar` `/checklist` `/tarefas` `/limpar_historico`", inline=False)
+    embed.set_footer(text="Powered by Groq LLaMA 3.3 + Tavily Search")
     await interaction.response.send_message(embed=embed)
 
 # ─── ARRANQUE ─────────────────────────────────────────────────────────────────
