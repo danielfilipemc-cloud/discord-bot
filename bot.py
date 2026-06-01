@@ -65,6 +65,30 @@ def web_search(query: str) -> str:
         return ""
 
 # ─── GROQ CHAT ────────────────────────────────────────────────────────────────
+def needs_search(text: str) -> bool:
+    no_search = [
+        "ficheiro", "arquivo", "file", "pasta", "documento",
+        "olá", "ola", "bom dia", "boa tarde", "boa noite",
+        "obrigado", "obrigada", "ok",
+        "o que és", "quem és", "como te chamas",
+    ]
+    text_lower = text.lower()
+    if any(k in text_lower for k in no_search):
+        return False
+    yes_search = [
+        "tempo", "clima", "meteorologia", "previsão",
+        "notícia", "noticia", "novidade", "hoje", "agora", "atual",
+        "preço", "cotação", "bolsa", "euro", "dólar",
+        "jogo", "resultado", "marcador", "liga", "futebol",
+        "quem é", "o que é", "quando", "onde fica",
+        "2024", "2025", "2026",
+        "última", "ultimo", "recente",
+        "lançamento", "novo", "nova",
+    ]
+    if any(k in text_lower for k in yes_search):
+        return True
+    return len(text.split()) > 5
+
 def ask_groq(user_id, user_message, search_context=None, system_override=None):
     uid = str(user_id)
     if uid not in conversation_history:
@@ -72,29 +96,34 @@ def ask_groq(user_id, user_message, search_context=None, system_override=None):
 
     hoje = datetime.now().strftime("%d/%m/%Y")
 
+    LINGUA = (
+        "Responde SEMPRE em português europeu (de Portugal). "
+        "NUNCA uses 'você', 'arquivo', 'celular' — usa 'tu', 'ficheiro', 'telemóvel'."
+    )
+
     if system_override:
         system = system_override
     elif search_context:
-        system = f"""És um assistente AI no Discord. Hoje é {hoje}.
-Respondes SEMPRE em português europeu, de forma direta e útil.
-Usa formatação Discord: **negrito**, `código`, etc.
-
-TENS ACESSO À INTERNET. Os seguintes resultados foram obtidos agora mesmo da web para responder à pergunta do utilizador:
-
-=== RESULTADOS WEB ATUAIS ===
-{search_context}
-=== FIM DOS RESULTADOS ===
-
-INSTRUÇÕES OBRIGATÓRIAS:
-1. USA os resultados acima para responder — são informação real e atual
-2. NUNCA digas que não tens acesso à internet — TENS, os resultados provam isso
-3. NUNCA digas que o teu conhecimento tem uma data limite — tens dados de hoje
-4. Responde com base nos resultados fornecidos, citando fontes quando útil
-5. Se os resultados não tiverem info suficiente, diz o que encontraste"""
+        system = (
+            f"És um assistente AI no Discord. Hoje é {hoje}.\n"
+            f"{LINGUA}\n"
+            "Usa formatação Discord: **negrito**, `código`, etc.\n\n"
+            "TENS ACESSO À INTERNET. Resultados obtidos agora mesmo da web:\n\n"
+            "=== RESULTADOS WEB ATUAIS ===\n"
+            f"{search_context}\n"
+            "=== FIM DOS RESULTADOS ===\n\n"
+            "INSTRUÇÕES:\n"
+            "1. USA os resultados para responder com informação atual\n"
+            "2. NUNCA digas que não tens acesso à internet\n"
+            "3. NUNCA digas que o teu conhecimento tem data limite\n"
+            "4. Cita as fontes quando útil"
+        )
     else:
-        system = f"""És um assistente AI no Discord. Hoje é {hoje}.
-Respondes SEMPRE em português europeu, de forma direta e útil.
-Usa formatação Discord: **negrito**, `código`, etc."""
+        system = (
+            f"És um assistente AI no Discord. Hoje é {hoje}.\n"
+            f"{LINGUA}\n"
+            "Usa formatação Discord: **negrito**, `código`, etc."
+        )
 
     conversation_history[uid].append({"role": "user", "content": user_message})
     if len(conversation_history[uid]) > MAX_HISTORY:
@@ -115,7 +144,7 @@ Usa formatação Discord: **negrito**, `código`, etc."""
 
 # ─── RESPOSTA PRINCIPAL ───────────────────────────────────────────────────────
 async def respond(content: str, user_id: int, reply_func):
-    search_context = web_search(content)
+    search_context = web_search(content) if needs_search(content) else None
     reply = ask_groq(user_id, content, search_context=search_context)
 
     if len(reply) <= 1900:
@@ -164,6 +193,29 @@ async def on_message(message):
 
     if is_mentioned or is_dm or is_bot_channel:
         content = message.content.replace(f"<@{bot.user.id}>", "").strip()
+
+        # Ler anexos de texto (txt, csv, md, etc.)
+        attachment_text = ""
+        for attachment in message.attachments:
+            filename = attachment.filename.lower()
+            text_exts = [".txt", ".md", ".csv", ".log", ".json", ".py", ".js", ".html", ".css"]
+            if any(filename.endswith(ext) for ext in text_exts):
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(attachment.url) as resp:
+                            file_content = await resp.text(encoding="utf-8", errors="replace")
+                            header = "\n\n[Conteudo do ficheiro " + attachment.filename + ":]\n"
+                            attachment_text += header + file_content[:3000]
+                except Exception as att_err:
+                    attachment_text += "\n[Erro ao ler " + attachment.filename + ": " + str(att_err) + "]"
+
+        if attachment_text:
+            if content:
+                content = content + attachment_text
+            else:
+                content = "O utilizador enviou um ficheiro. Conteudo:" + attachment_text
+
         if not content:
             await message.reply("Olá! Como posso ajudar? 👋")
             return
