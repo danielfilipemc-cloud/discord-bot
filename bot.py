@@ -49,7 +49,7 @@ def get_server_data(guild_id):
         server_data[gid] = {"tasks": [], "checklist": []}
     return server_data[gid]
 
-# ─── PESQUISA WEB (sempre ativa) ──────────────────────────────────────────────
+# ─── PESQUISA WEB ─────────────────────────────────────────────────────────────
 def web_search(query: str) -> str:
     try:
         results = tavily.search(query=query, max_results=5, search_depth="basic")
@@ -58,42 +58,49 @@ def web_search(query: str) -> str:
             title   = r.get("title", "")
             content = r.get("content", "")[:500]
             url     = r.get("url", "")
-            output.append(f"Título: {title}\nConteúdo: {content}\nURL: {url}")
-        return "\n\n---\n\n".join(output) if output else "Sem resultados."
+            output.append(f"- {title}: {content} (fonte: {url})")
+        return "\n".join(output) if output else ""
     except Exception as e:
-        return f"Erro na pesquisa web: {e}"
+        print(f"Tavily error: {e}")
+        return ""
 
 # ─── GROQ CHAT ────────────────────────────────────────────────────────────────
-def ask_groq(user_id, user_message, system_prompt=None, search_context=None):
+def ask_groq(user_id, user_message, search_context=None, system_override=None):
     uid = str(user_id)
     if uid not in conversation_history:
         conversation_history[uid] = []
 
-    if search_context:
-        full_message = (
-            f"[Informação atual da web, data de hoje: {datetime.now().strftime('%d/%m/%Y')}]\n"
-            f"{search_context}\n\n"
-            f"[Pergunta do utilizador]\n{user_message}"
-        )
+    hoje = datetime.now().strftime("%d/%m/%Y")
+
+    if system_override:
+        system = system_override
+    elif search_context:
+        system = f"""És um assistente AI no Discord. Hoje é {hoje}.
+Respondes SEMPRE em português europeu, de forma direta e útil.
+Usa formatação Discord: **negrito**, `código`, etc.
+
+TENS ACESSO À INTERNET. Os seguintes resultados foram obtidos agora mesmo da web para responder à pergunta do utilizador:
+
+=== RESULTADOS WEB ATUAIS ===
+{search_context}
+=== FIM DOS RESULTADOS ===
+
+INSTRUÇÕES OBRIGATÓRIAS:
+1. USA os resultados acima para responder — são informação real e atual
+2. NUNCA digas que não tens acesso à internet — TENS, os resultados provam isso
+3. NUNCA digas que o teu conhecimento tem uma data limite — tens dados de hoje
+4. Responde com base nos resultados fornecidos, citando fontes quando útil
+5. Se os resultados não tiverem info suficiente, diz o que encontraste"""
     else:
-        full_message = user_message
+        system = f"""És um assistente AI no Discord. Hoje é {hoje}.
+Respondes SEMPRE em português europeu, de forma direta e útil.
+Usa formatação Discord: **negrito**, `código`, etc."""
 
-    conversation_history[uid].append({"role": "user", "content": full_message})
-
+    conversation_history[uid].append({"role": "user", "content": user_message})
     if len(conversation_history[uid]) > MAX_HISTORY:
         conversation_history[uid] = conversation_history[uid][-MAX_HISTORY:]
 
-    sys_prompt = system_prompt or (
-        "És um assistente AI integrado no Discord. "
-        "Respondes SEMPRE em português europeu. "
-        "Tens acesso a informação atualizada da internet que é fornecida antes de cada pergunta. "
-        "NUNCA digas que não tens acesso à internet — tens, através dos resultados de pesquisa fornecidos. "
-        "Usa sempre a informação da web para responder com dados atuais e precisos. "
-        "Cita as fontes quando relevante. "
-        "Usa formatação Discord: **negrito**, `código`, etc."
-    )
-
-    messages = [{"role": "system", "content": sys_prompt}] + conversation_history[uid]
+    messages = [{"role": "system", "content": system}] + conversation_history[uid]
 
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
@@ -103,13 +110,11 @@ def ask_groq(user_id, user_message, system_prompt=None, search_context=None):
     )
 
     reply = response.choices[0].message.content
-    conversation_history[uid][-1] = {"role": "user", "content": user_message}
     conversation_history[uid].append({"role": "assistant", "content": reply})
     return reply
 
-# ─── RESPOSTA COM PESQUISA AUTOMÁTICA ─────────────────────────────────────────
+# ─── RESPOSTA PRINCIPAL ───────────────────────────────────────────────────────
 async def respond(content: str, user_id: int, reply_func):
-    # Pesquisa sempre na web
     search_context = web_search(content)
     reply = ask_groq(user_id, content, search_context=search_context)
 
@@ -174,24 +179,21 @@ async def handle_checklist_message(message):
     guild_id = message.guild.id
     data = get_server_data(guild_id)
 
-    prompt = f"""
-Utilizador disse: "{message.content}"
+    prompt = f"""Utilizador disse: "{message.content}"
 Checklist atual: {json.dumps(data['checklist'], ensure_ascii=False)}
 
-Responde APENAS com JSON:
-- {{"action": "add", "item": "nome"}}
-- {{"action": "check", "item": "nome"}}
-- {{"action": "uncheck", "item": "nome"}}
-- {{"action": "remove", "item": "nome"}}
-- {{"action": "show"}}
-- {{"action": "clear_done"}}
-- {{"action": "unknown"}}
-"""
+Responde APENAS com JSON, sem mais texto:
+{{"action": "add"|"check"|"uncheck"|"remove"|"show"|"clear_done"|"unknown", "item": "nome se aplicável"}}"""
+
     try:
         raw = ask_groq(message.author.id + 99999, prompt,
-                       system_prompt="Respondes APENAS com JSON válido, sem texto extra.")
+                       system_override="Respondes APENAS com JSON válido numa única linha, sem texto extra, sem markdown.")
         raw = re.sub(r"```json|```", "", raw).strip()
-        result = json.loads(raw)
+        # pegar só o primeiro JSON da resposta
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        result    = json.loads(raw)
         action    = result.get("action")
         item_name = result.get("item", "").strip()
 
@@ -201,10 +203,11 @@ Responde APENAS com JSON:
             await message.add_reaction("✅")
             await show_checklist(message, data)
         elif action == "check":
-            matched = any(item_name.lower() in i["text"].lower() for i in data["checklist"])
+            matched = False
             for item in data["checklist"]:
                 if item_name.lower() in item["text"].lower():
                     item["done"] = True
+                    matched = True
             if matched:
                 save_data(server_data)
                 await message.add_reaction("✅")
@@ -232,7 +235,7 @@ Responde APENAS com JSON:
         else:
             await message.reply("❓ Tenta: *'adiciona X'*, *'marca X como feito'*, *'mostra a lista'*")
     except Exception as e:
-        await message.reply(f"❌ Erro: `{e}`")
+        await message.reply(f"❌ Erro checklist: `{e}`")
 
 async def show_checklist(message, data):
     if not data["checklist"]:
@@ -250,21 +253,19 @@ async def handle_task_message(message):
     guild_id = message.guild.id
     data = get_server_data(guild_id)
 
-    prompt = f"""
-Utilizador disse: "{message.content}"
+    prompt = f"""Utilizador disse: "{message.content}"
 Tarefas: {json.dumps(data['tasks'], ensure_ascii=False)}
 
-Responde APENAS com JSON:
-- {{"action": "add", "title": "título", "desc": "opcional"}}
-- {{"action": "done", "title": "título"}}
-- {{"action": "remove", "title": "título"}}
-- {{"action": "show"}}
-- {{"action": "unknown"}}
-"""
+Responde APENAS com JSON numa única linha:
+{{"action": "add"|"done"|"remove"|"show"|"unknown", "title": "título", "desc": "opcional"}}"""
+
     try:
         raw = ask_groq(message.author.id + 88888, prompt,
-                       system_prompt="Respondes APENAS com JSON válido, sem texto extra.")
+                       system_override="Respondes APENAS com JSON válido numa única linha, sem texto extra, sem markdown.")
         raw = re.sub(r"```json|```", "", raw).strip()
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
         result = json.loads(raw)
         action = result.get("action")
         title  = result.get("title", "").strip()
@@ -293,7 +294,7 @@ Responde APENAS com JSON:
         else:
             await message.reply("❓ Tenta: *'adiciona tarefa X'*, *'marca X como feita'*")
     except Exception as e:
-        await message.reply(f"❌ Erro: `{e}`")
+        await message.reply(f"❌ Erro tarefas: `{e}`")
 
 async def show_tasks(message, data):
     if not data["tasks"]:
@@ -370,7 +371,7 @@ async def slash_help(interaction: discord.Interaction):
         "• Em DM: escreve diretamente\n"
         "• Canais com 'bot' ou 'ia' no nome: escreve livremente"
     ), inline=False)
-    embed.add_field(name="🔍 Pesquisa Web", value="Pesquiso sempre na web antes de responder — tens sempre info atualizada!", inline=False)
+    embed.add_field(name="🔍 Pesquisa Web", value="Pesquiso sempre na web antes de responder!", inline=False)
     embed.add_field(name="✅ Checklist (#checklist)", value=(
         "• *'adiciona X'* • *'marca X como feito'*\n• *'mostra a lista'* • *'limpa os feitos'*"
     ), inline=False)
